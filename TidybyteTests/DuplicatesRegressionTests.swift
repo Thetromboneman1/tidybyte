@@ -6,6 +6,7 @@ import XCTest
 private func makeAsset(
     id: String,
     fileSize: Int64 = 8_000_000,
+    primaryResourceSize: Int64? = nil,
     pixelWidth: Int = 4032,
     pixelHeight: Int = 3024,
     locallyAvailable: Bool = true,
@@ -21,6 +22,7 @@ private func makeAsset(
         pixelHeight: pixelHeight,
         duration: 0,
         fileSize: fileSize,
+        primaryResourceSize: primaryResourceSize ?? fileSize,
         filename: "\(id).jpg",
         isFavorite: isFavorite,
         isBurst: false,
@@ -62,6 +64,39 @@ private func greedyGroups(
             if let candidates, !candidates.contains(PairKey(anchor, other)) {
                 continue
             }
+            if similar(hashes[anchor]!, hashes[other]!) {
+                group.append(other)
+                visited.insert(other)
+            }
+        }
+        if group.count > 1 { groups.append(group) }
+    }
+    return groups
+}
+
+/// Same greedy semantics, but traverses the production adjacency list instead
+/// of every possible pair. Used to prove the optimization preserves grouping.
+private func greedyGroupsUsingCandidateIndices(
+    hashes: [String: UInt64],
+    similar: (UInt64, UInt64) -> Bool,
+    candidates: Set<PairKey>
+) -> [[String]] {
+    let ids = hashes.keys.sorted()
+    let indices = VisualPreFilter.candidateIndicesByAnchor(
+        assetIds: ids,
+        candidates: candidates
+    )
+    var visited = Set<String>()
+    var groups: [[String]] = []
+
+    for index in ids.indices {
+        let anchor = ids[index]
+        guard !visited.contains(anchor) else { continue }
+        var group = [anchor]
+        visited.insert(anchor)
+        for candidateIndex in indices[index] {
+            let other = ids[candidateIndex]
+            guard !visited.contains(other) else { continue }
             if similar(hashes[anchor]!, hashes[other]!) {
                 group.append(other)
                 visited.insert(other)
@@ -214,6 +249,76 @@ final class DuplicatesRegressionTests: XCTestCase {
         XCTAssertFalse(candidates.contains(PairKey("normal", "far")))
     }
 
+    func testCandidateIndicesPreservePhotoKitOrder() {
+        let ids = ["z", "a", "m", "b"]
+        let candidates: Set<PairKey> = [
+            PairKey("z", "b"),
+            PairKey("z", "a"),
+            PairKey("a", "m")
+        ]
+
+        let indices = VisualPreFilter.candidateIndicesByAnchor(
+            assetIds: ids,
+            candidates: candidates
+        )
+
+        XCTAssertEqual(indices, [[1, 3], [2], [], []])
+    }
+
+    func testCandidateAdjacencyAvoidsFullPairTraversalForLargeLibrary() {
+        let ids = (0..<37_214).map { "asset-\($0)" }
+        let candidates: Set<PairKey> = [
+            PairKey("asset-1", "asset-2"),
+            PairKey("asset-100", "asset-200"),
+            PairKey("asset-37000", "asset-37213")
+        ]
+
+        let indices = VisualPreFilter.candidateIndicesByAnchor(
+            assetIds: ids,
+            candidates: candidates
+        )
+
+        XCTAssertEqual(indices.reduce(0) { $0 + $1.count }, candidates.count)
+        XCTAssertEqual(indices[1], [2])
+        XCTAssertEqual(indices[100], [200])
+        XCTAssertEqual(indices[37_000], [37_213])
+    }
+
+    func testCandidateAdjacencyUsesInputOrderInsteadOfLexicalPairOrder() {
+        let ids = ["z", "a", "m", "b"]
+        let hashes: [String: UInt64] = [
+            "z": 0xAAAAAAAAAAAAAAAA,
+            "a": 0xAAAAAAAAAAAAAAAA,
+            "m": 0xCCCCCCCCCCCCCCCC,
+            "b": 0xAAAAAAAAAAAAAAA8
+        ]
+        let candidates: Set<PairKey> = [
+            PairKey("z", "a"),
+            PairKey("z", "b"),
+            PairKey("a", "m")
+        ]
+        let indices = VisualPreFilter.candidateIndicesByAnchor(
+            assetIds: ids,
+            candidates: candidates
+        )
+
+        var visited = Set<String>()
+        var adjacencyGroup: [String] = []
+        let anchor = ids[0]
+        visited.insert(anchor)
+        adjacencyGroup.append(anchor)
+        for candidateIndex in indices[0] {
+            let candidate = ids[candidateIndex]
+            guard !visited.contains(candidate),
+                  VisualPreFilter.shouldCompare(hashes[anchor]!, hashes[candidate]!) else { continue }
+            visited.insert(candidate)
+            adjacencyGroup.append(candidate)
+        }
+
+        XCTAssertEqual(indices, [[1, 3], [2], [], []])
+        XCTAssertEqual(adjacencyGroup, ["z", "a", "b"])
+    }
+
     func testHash64IsNeverZeroForNonEmptyGrid() {
         // The 0 sentinel must never be produced naturally: uniform grids hash
         // to all-ones (every cell >= the grid mean), and a varied grid has a
@@ -268,6 +373,30 @@ final class DuplicatesRegressionTests: XCTestCase {
         XCTAssertEqual(Set(newGroups), Set(oldGroups))
     }
 
+    func testCandidateAdjacencyGroupingMatchesFullCandidateLoop() {
+        let hashes = pseudoRandomHashes(count: 200).merging([
+            "duplicate-a": 0xAAAAAAAAAAAAAAAA,
+            "duplicate-b": 0xAAAAAAAAAAAAAAAA,
+            "near-a": 0xCCCCCCCCCCCCCCCC,
+            "near-b": 0xCCCCCCCCCCCCCCC8
+        ]) { current, _ in current }
+        let candidates = VisualPreFilter.candidatePairs(hashes)
+        let similar: (UInt64, UInt64) -> Bool = { VisualPreFilter.shouldCompare($0, $1) }
+
+        let fullLoopGroups = greedyGroups(
+            hashes: hashes,
+            similar: similar,
+            candidates: candidates
+        )
+        let adjacencyGroups = greedyGroupsUsingCandidateIndices(
+            hashes: hashes,
+            similar: similar,
+            candidates: candidates
+        )
+
+        XCTAssertEqual(adjacencyGroups, fullLoopGroups)
+    }
+
     // MARK: DUP-03: iCloud-only skipping
 
     func testSplitByLocalAvailabilityCountsSkipped() {
@@ -286,6 +415,53 @@ final class DuplicatesRegressionTests: XCTestCase {
         let (candidates, skipped) = DuplicateDetectionService.splitByLocalAvailability(assets)
         XCTAssertEqual(skipped, 0)
         XCTAssertEqual(Set(candidates.map(\.id)), ["a", "b"])
+    }
+
+    // MARK: Exact duplicate size pre-filter
+
+    func testExactHashCandidatesKeepOnlyRepeatedPrimaryResourceSizes() {
+        let assets = [
+            makeAsset(id: "unique-a", primaryResourceSize: 8_000_001),
+            makeAsset(id: "duplicate-a", primaryResourceSize: 9_000_000),
+            makeAsset(id: "duplicate-b", primaryResourceSize: 9_000_000),
+            makeAsset(id: "unique-b", primaryResourceSize: 10_000_000)
+        ]
+
+        let candidates = DuplicateDetectionService.exactHashCandidates(assets)
+
+        XCTAssertEqual(candidates.map(\.id), ["duplicate-a", "duplicate-b"])
+    }
+
+    func testExactHashCandidatesFallBackToDimensionBucketWhenSizeIsUnknown() {
+        let assets = [
+            makeAsset(id: "known-a", primaryResourceSize: 8_000_000),
+            makeAsset(id: "unknown", primaryResourceSize: 0),
+            makeAsset(id: "known-b", primaryResourceSize: 9_000_000),
+            makeAsset(id: "different-dimensions", primaryResourceSize: 0, pixelWidth: 1920, pixelHeight: 1080)
+        ]
+
+        let candidates = DuplicateDetectionService.exactHashCandidates(assets)
+
+        XCTAssertEqual(
+            candidates.map(\.id),
+            ["known-a", "unknown", "known-b"],
+            "unknown size metadata must preserve every possible match in the same dimension bucket"
+        )
+    }
+
+    func testExactHashCandidatesSkipUniqueSizesInLargeCameraLibrary() {
+        let assetCount = 37_214
+        var assets = (0..<assetCount).map { index in
+            makeAsset(id: "asset-\(index)", primaryResourceSize: Int64(1_000_000 + index))
+        }
+        assets[assetCount - 1] = makeAsset(
+            id: "duplicate-last",
+            primaryResourceSize: assets[assetCount - 2].primaryResourceSize
+        )
+
+        let candidates = DuplicateDetectionService.exactHashCandidates(assets)
+
+        XCTAssertEqual(candidates.map(\.id), ["asset-37212", "duplicate-last"])
     }
 
     // MARK: DUP-04: group-scoped delete and select-all

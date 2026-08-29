@@ -821,6 +821,7 @@ actor PhotoLibraryService {
             pixelHeight: asset.pixelHeight,
             duration: asset.duration,
             fileSize: estimateFileSize(from: resources),
+            primaryResourceSize: preferredPrimaryResource(from: resources).map(safeFileSize(for:)) ?? 0,
             filename: resources.first?.originalFilename,
             isFavorite: asset.isFavorite,
             isBurst: asset.representsBurst,

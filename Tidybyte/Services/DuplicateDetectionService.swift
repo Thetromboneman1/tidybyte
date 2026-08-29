@@ -168,6 +168,32 @@ enum VisualPreFilter {
         return pairs
     }
 
+    /// Converts the unordered candidate set into the original PhotoKit order.
+    /// The visual scan can then visit only candidate edges instead of walking
+    /// every possible pair and asking the set whether each one survived.
+    static func candidateIndicesByAnchor(
+        assetIds: [String],
+        candidates: Set<PairKey>
+    ) -> [[Int]] {
+        var indexByID: [String: Int] = [:]
+        for (index, id) in assetIds.enumerated() where indexByID[id] == nil {
+            indexByID[id] = index
+        }
+        var result = Array(repeating: [Int](), count: assetIds.count)
+
+        for pair in candidates {
+            guard let first = indexByID[pair.a], let second = indexByID[pair.b] else { continue }
+            let anchor = min(first, second)
+            let candidate = max(first, second)
+            result[anchor].append(candidate)
+        }
+
+        for index in result.indices {
+            result[index].sort()
+        }
+        return result
+    }
+
     /// Every `width`-bit value within Hamming distance `radius` (inclusive).
     static func nearValues(to value: Int, radius: Int, width: Int = 16) -> [Int] {
         var result: [Int] = [value]
@@ -225,52 +251,81 @@ actor DuplicateDetectionService {
         return (candidates, skipped)
     }
 
+    /// Exact byte matches must have the same primary-resource length. Use that
+    /// cheap metadata to avoid streaming every full-resolution asset through
+    /// SHA-256. When PhotoKit does not expose a resource size, keep the entire
+    /// matching dimension bucket so the optimization cannot hide a duplicate.
+    static func exactHashCandidates(_ assets: [AssetSummary]) -> [AssetSummary] {
+        var dimensionBuckets: [String: [AssetSummary]] = [:]
+        for asset in assets {
+            let key = "\(asset.pixelWidth)x\(asset.pixelHeight)_\(asset.mediaType)"
+            dimensionBuckets[key, default: []].append(asset)
+        }
+
+        var candidateIDs = Set<String>()
+        for bucket in dimensionBuckets.values where bucket.count > 1 {
+            if bucket.contains(where: { $0.primaryResourceSize <= 0 }) {
+                candidateIDs.formUnion(bucket.map(\.id))
+                continue
+            }
+
+            let sizeBuckets = Dictionary(grouping: bucket, by: \.primaryResourceSize)
+            for sizeBucket in sizeBuckets.values where sizeBucket.count > 1 {
+                candidateIDs.formUnion(sizeBucket.map(\.id))
+            }
+        }
+
+        // Preserve PhotoKit's input order for deterministic hashing and progress.
+        return assets.filter { candidateIDs.contains($0.id) }
+    }
+
     func findExactDuplicates(
         assets: [AssetSummary],
         progress: @Sendable (Float) -> Void
     ) async -> ExactDuplicateResult {
         // Pre-filter pass (reports 0 → 0.1 so the bar moves during this phase;
-        // DUP-12): bucket by (width, height, mediaType) to reduce comparisons.
+        // DUP-12): bucket by dimensions, media type, and the primary resource's
+        // exact byte length. Common camera dimensions alone keep most large
+        // libraries in the hash set; byte length removes unique assets without
+        // changing exact-match results.
         // Assets that aren't on this device are skipped — hashing them would
         // download the full resource from iCloud (DUP-03) — and counted so the
         // UI can surface "N iCloud-only photos skipped".
         let (localAssets, skippedCount) = Self.splitByLocalAvailability(assets)
-        var candidates: [String: [AssetSummary]] = [:]
         let total = assets.count
-        for (index, asset) in localAssets.enumerated() {
+        for (index, _) in localAssets.enumerated() {
             if Task.isCancelled {
                 return ExactDuplicateResult(groups: [], skippedCount: skippedCount)
             }
             if index % 20 == 0 {
                 await Task.yield()
             }
-            let key = "\(asset.pixelWidth)x\(asset.pixelHeight)_\(asset.mediaType)"
-            candidates[key, default: []].append(asset)
             progress(Float(index + 1) / Float(max(total, 1)) * 0.1)
         }
 
-        // Only keep groups with potential duplicates
-        let potentialGroups = candidates.values.filter { $0.count > 1 }
-        let totalAssets = potentialGroups.reduce(0) { $0 + $1.count }
+        let hashCandidates = Self.exactHashCandidates(localAssets)
+        let totalAssets = hashCandidates.count
         var processed = 0
 
         var hashGroups: [String: [AssetSummary]] = [:]
 
-        for group in potentialGroups {
-            for asset in group {
-                if Task.isCancelled {
-                    return ExactDuplicateResult(groups: [], skippedCount: skippedCount)
-                }
-                if processed % 20 == 0 {
-                    await Task.yield()
-                }
-                // Stream the hash so large videos aren't loaded fully into memory.
-                if let hashString = await photoService.sha256ForPrimaryResource(of: asset.id) {
-                    hashGroups[hashString, default: []].append(asset)
-                }
-                processed += 1
-                progress(0.1 + Float(processed) / Float(max(totalAssets, 1)) * 0.9)
+        for asset in hashCandidates {
+            if Task.isCancelled {
+                return ExactDuplicateResult(groups: [], skippedCount: skippedCount)
             }
+            if processed % 20 == 0 {
+                await Task.yield()
+            }
+            // Stream the hash so large videos aren't loaded fully into memory.
+            if let hashString = await photoService.sha256ForPrimaryResource(of: asset.id) {
+                hashGroups[hashString, default: []].append(asset)
+            }
+            processed += 1
+            progress(0.1 + Float(processed) / Float(max(totalAssets, 1)) * 0.9)
+        }
+
+        if hashCandidates.isEmpty {
+            progress(1)
         }
 
         let groups = hashGroups
@@ -298,13 +353,11 @@ actor DuplicateDetectionService {
     ) async -> [DuplicateGroup] {
         let photoAssets = assets.filter { $0.mediaType == .photo }
         let total = photoAssets.count
-        let estimatedPairs = total * (total - 1) / 2
-        // Weight the generation and comparison phases by their actual work
-        // (generation: per asset; comparison: per attempted pair) so neither
-        // phase stalls the progress bar (DUP-01/DUP-12).
-        let generationWeight: Float = total + estimatedPairs > 0
-            ? Float(total) / Float(total + estimatedPairs)
-            : 1
+        // Thumbnail loading and Vision feature generation dominate normal
+        // scans. Giving that phase a stable share keeps large-library progress
+        // visible instead of weighting it against an n-squared theoretical
+        // pair count and displaying 0% for most of the scan.
+        let generationWeight: Float = 0.8
         let comparisonWeight = 1 - generationWeight
 
         // Phase 1 (0 → generationWeight): feature prints plus the cheap
@@ -339,27 +392,49 @@ actor DuplicateDetectionService {
             }
         }
         let candidateSet = VisualPreFilter.candidatePairs(hashesByAsset)
+        let candidateIndices = VisualPreFilter.candidateIndicesByAnchor(
+            assetIds: featurePrints.map { $0.asset.id },
+            candidates: candidateSet
+        )
+        let totalCandidateEdges = max(candidateSet.count, 1)
+        let progressUpdateStride = 128
 
         // Phase 2 (generationWeight → 1): greedy grouping, unchanged semantics
         // (same anchor order, same threshold, same visited handling).
         var visited = Set<String>()
         var groups: [DuplicateGroup] = []
-        var attemptedPairs = 0
+        var processedCandidateEdges = 0
 
         for i in 0..<featurePrints.count {
             // Preserve groups already found rather than discarding completed work on cancel.
             if Task.isCancelled { return groups.sorted { $0.assets.count > $1.assets.count } }
-            guard !visited.contains(featurePrints[i].asset.id) else { continue }
+            guard !visited.contains(featurePrints[i].asset.id) else {
+                processedCandidateEdges += candidateIndices[i].count
+                if !candidateIndices[i].isEmpty
+                    && (processedCandidateEdges.isMultiple(of: progressUpdateStride)
+                        || processedCandidateEdges == candidateSet.count) {
+                    progress(
+                        generationWeight
+                        + comparisonWeight * Float(processedCandidateEdges) / Float(totalCandidateEdges)
+                    )
+                }
+                continue
+            }
 
             var group: [AssetSummary] = [featurePrints[i].asset]
             visited.insert(featurePrints[i].asset.id)
 
-            for j in (i + 1)..<featurePrints.count {
+            for j in candidateIndices[i] {
                 if Task.isCancelled { return groups.sorted { $0.assets.count > $1.assets.count } }
-                guard !visited.contains(featurePrints[j].asset.id) else { continue }
-                attemptedPairs += 1
-
-                guard candidateSet.contains(PairKey(featurePrints[i].asset.id, featurePrints[j].asset.id)) else {
+                processedCandidateEdges += 1
+                guard !visited.contains(featurePrints[j].asset.id) else {
+                    if processedCandidateEdges.isMultiple(of: progressUpdateStride)
+                        || processedCandidateEdges == candidateSet.count {
+                        progress(
+                            generationWeight
+                            + comparisonWeight * Float(processedCandidateEdges) / Float(totalCandidateEdges)
+                        )
+                    }
                     continue
                 }
 
@@ -371,6 +446,14 @@ actor DuplicateDetectionService {
                 if distance < threshold {
                     group.append(featurePrints[j].asset)
                     visited.insert(featurePrints[j].asset.id)
+                }
+
+                if processedCandidateEdges.isMultiple(of: progressUpdateStride)
+                    || processedCandidateEdges == candidateSet.count {
+                    progress(
+                        generationWeight
+                        + comparisonWeight * Float(processedCandidateEdges) / Float(totalCandidateEdges)
+                    )
                 }
             }
 
@@ -384,9 +467,9 @@ actor DuplicateDetectionService {
                 ))
             }
 
-            progress(generationWeight + comparisonWeight * Float(attemptedPairs) / Float(max(estimatedPairs, 1)))
         }
 
+        progress(1)
         return groups.sorted { $0.assets.count > $1.assets.count }
     }
 
