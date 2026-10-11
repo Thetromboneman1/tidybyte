@@ -24,6 +24,7 @@ class WorkflowPinsTest < Minitest::Test
           steps:
             - uses: #{PINNED}
             - uses: ./local-action
+            - uses: $/.github/actions/self-action
             - uses: #{PINNED}
               with:
                 uses: production
@@ -48,6 +49,33 @@ class WorkflowPinsTest < Minitest::Test
     source = "jobs: {test: {uses: owner/repository/.github/workflows/test.yml@main}}"
 
     assert_equal 1, findings_for(source).length
+  end
+
+  def test_rejects_mutable_actions_nested_in_parallel_step_groups
+    source = <<~YAML
+      jobs:
+        test:
+          steps:
+            - parallel:
+                - uses: #{PINNED}
+                - parallel:
+                    - uses: actions/setup-node@v7
+    YAML
+
+    assert_equal 1, findings_for(source).length
+  end
+
+  def test_accepts_pinned_actions_nested_in_parallel_step_groups
+    source = <<~YAML
+      jobs:
+        test:
+          steps:
+            - parallel:
+                - uses: #{PINNED}
+                - uses: $/.github/actions/self-action
+    YAML
+
+    assert_empty findings_for(source)
   end
 
   def test_accepts_standard_yaml_date_scalars_outside_invocations

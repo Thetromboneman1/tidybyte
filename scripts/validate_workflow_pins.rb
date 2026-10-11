@@ -19,7 +19,7 @@ module WorkflowPins
         aliases: true
       )
       action_references(document).filter_map do |reference|
-        next if reference.start_with?("./")
+        next if reference.start_with?("./", "$/")
 
         revision = reference.include?("@") ? reference.rpartition("@").last : ""
         next if FULL_SHA.match?(revision)
@@ -40,11 +40,20 @@ module WorkflowPins
 
       references = []
       references << String(job["uses"]) if job.key?("uses")
-      if job["steps"].is_a?(Array)
-        job["steps"].each do |step|
-          references << String(step["uses"]) if step.is_a?(Hash) && step.key?("uses")
-        end
-      end
+      references.concat(step_references(job["steps"]))
+      references
+    end
+  end
+
+  def step_references(steps)
+    return [] unless steps.is_a?(Array)
+
+    steps.flat_map do |step|
+      next [] unless step.is_a?(Hash)
+
+      references = []
+      references << String(step["uses"]) if step.key?("uses")
+      references.concat(step_references(step["parallel"]))
       references
     end
   end
