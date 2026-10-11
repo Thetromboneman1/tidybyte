@@ -13,7 +13,7 @@ module WorkflowPins
   def mutable_references(paths = Dir.glob(File.join(WORKFLOWS, "*.{yml,yaml}")))
     paths.sort.flat_map do |path|
       document = YAML.safe_load_file(path, aliases: true)
-      references(document).filter_map do |reference|
+      action_references(document).filter_map do |reference|
         next if reference.start_with?("./")
 
         revision = reference.include?("@") ? reference.rpartition("@").last : ""
@@ -26,17 +26,21 @@ module WorkflowPins
     end
   end
 
-  def references(node)
-    case node
-    when Hash
-      node.flat_map do |key, value|
-        current = key == "uses" ? [String(value)] : []
-        current + references(value)
+  def action_references(document)
+    jobs = document.is_a?(Hash) ? document["jobs"] : nil
+    return [] unless jobs.is_a?(Hash)
+
+    jobs.values.flat_map do |job|
+      next [] unless job.is_a?(Hash)
+
+      references = []
+      references << String(job["uses"]) if job.key?("uses")
+      if job["steps"].is_a?(Array)
+        job["steps"].each do |step|
+          references << String(step["uses"]) if step.is_a?(Hash) && step.key?("uses")
+        end
       end
-    when Array
-      node.flat_map { |value| references(value) }
-    else
-      []
+      references
     end
   end
 

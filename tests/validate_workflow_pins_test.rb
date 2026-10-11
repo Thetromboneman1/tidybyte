@@ -19,9 +19,14 @@ class WorkflowPinsTest < Minitest::Test
     source = <<~YAML
       jobs:
         test:
+          uses: ./.github/workflows/reusable.yml
+        build:
           steps:
             - uses: #{PINNED}
             - uses: ./local-action
+            - uses: #{PINNED}
+              with:
+                uses: production
     YAML
 
     assert_empty findings_for(source)
@@ -37,6 +42,12 @@ class WorkflowPinsTest < Minitest::Test
     sources.each do |source|
       assert_equal 1, findings_for(source).length
     end
+  end
+
+  def test_rejects_mutable_job_level_reusable_workflow
+    source = "jobs: {test: {uses: owner/repository/.github/workflows/test.yml@main}}"
+
+    assert_equal 1, findings_for(source).length
   end
 
   def test_rejects_invalid_yaml
