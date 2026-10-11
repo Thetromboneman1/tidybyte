@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require "date"
 require "yaml"
 
 module WorkflowPins
@@ -12,7 +13,11 @@ module WorkflowPins
 
   def mutable_references(paths = Dir.glob(File.join(WORKFLOWS, "*.{yml,yaml}")))
     paths.sort.flat_map do |path|
-      document = YAML.safe_load_file(path, aliases: true)
+      document = YAML.safe_load_file(
+        path,
+        permitted_classes: [Date, Time],
+        aliases: true
+      )
       action_references(document).filter_map do |reference|
         next if reference.start_with?("./")
 

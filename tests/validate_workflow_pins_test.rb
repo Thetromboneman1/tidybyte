@@ -50,6 +50,19 @@ class WorkflowPinsTest < Minitest::Test
     assert_equal 1, findings_for(source).length
   end
 
+  def test_accepts_standard_yaml_date_scalars_outside_invocations
+    source = <<~YAML
+      env:
+        RELEASE_DATE: 2026-10-11
+      jobs:
+        test:
+          steps:
+            - uses: #{PINNED}
+    YAML
+
+    assert_empty findings_for(source)
+  end
+
   def test_rejects_invalid_yaml
     refute_empty findings_for("jobs: [")
   end
